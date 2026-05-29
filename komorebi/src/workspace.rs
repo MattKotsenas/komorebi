@@ -1064,8 +1064,30 @@ impl Workspace {
     pub fn remove_window(&mut self, hwnd: isize) -> eyre::Result<()> {
         border_manager::delete_border(hwnd);
 
-        if self.floating_windows().iter().any(|w| w.hwnd == hwnd) {
-            self.floating_windows_mut().retain(|w| w.hwnd != hwnd);
+        if let Some(removed_idx) = self.floating_windows().iter().position(|w| w.hwnd == hwnd) {
+            self.floating_windows_mut().remove(removed_idx);
+
+            let new_len = self.floating_windows().len();
+            if new_len == 0 {
+                // No floating windows remain; fall back to the Tiling layer so
+                // subsequent focus commands route to the tiled containers
+                // instead of getting stuck routing into an empty floating layer
+                // (which manifests as a missing focus border and silently
+                // failing direction keys until the user "rolls" through several
+                // directions to recover).
+                self.layer = WorkspaceLayer::Tiling;
+                self.floating_windows.focus(0);
+            } else {
+                // Keep the Ring's focused index within bounds. If the removed
+                // window was the focused one and it was at the end, shift
+                // focus down by one; otherwise leave the focus pointing at
+                // whatever now occupies that slot.
+                let focused_idx = self.floating_windows.focused_idx();
+                if focused_idx >= new_len {
+                    self.floating_windows.focus(new_len - 1);
+                }
+            }
+
             return Ok(());
         }
 
@@ -2685,5 +2707,82 @@ mod tests {
             assert_eq!(visible_windows[1].unwrap().hwnd, 100);
             assert_eq!(visible_windows[2].unwrap().hwnd, 300);
         }
+    }
+
+    #[test]
+    fn test_remove_last_floating_window_resets_layer_to_tiling() {
+        // Regression: when the last (or only) floating window is destroyed
+        // while the workspace is on the Floating layer, the workspace must
+        // fall back to the Tiling layer so subsequent focus commands route
+        // to the tiled containers instead of getting stuck in the empty
+        // floating layer (no focus border, direction keys silently fail).
+        let mut workspace = Workspace::default();
+
+        // One tiled container so there is something to fall back to.
+        let mut container = Container::default();
+        container.windows_mut().push_back(Window::from(100));
+        workspace.add_container_to_back(container);
+
+        // One floating window, currently focused.
+        workspace.floating_windows_mut().push_back(Window::from(999));
+        workspace.layer = WorkspaceLayer::Floating;
+
+        // Preconditions: prove we really are starting from a Floating layer
+        // with a single floating window present.
+        assert_eq!(workspace.layer, WorkspaceLayer::Floating);
+        assert_eq!(workspace.floating_windows().len(), 1);
+
+        workspace.remove_window(999).unwrap();
+
+        assert_eq!(workspace.floating_windows().len(), 0);
+        assert_eq!(
+            workspace.layer,
+            WorkspaceLayer::Tiling,
+            "workspace should fall back to Tiling when the last floating window is removed"
+        );
+    }
+
+    #[test]
+    fn test_remove_floating_window_keeps_focused_idx_in_bounds() {
+        // Regression: removing the focused-floating-window must not leave
+        // the floating_windows Ring with an out-of-range focused index.
+        let mut workspace = Workspace::default();
+
+        workspace.floating_windows_mut().push_back(Window::from(10));
+        workspace.floating_windows_mut().push_back(Window::from(20));
+        workspace.floating_windows.focus(1);
+        workspace.layer = WorkspaceLayer::Floating;
+
+        // Precondition: focused idx points at the trailing entry.
+        assert_eq!(workspace.focused_floating_window_idx(), 1);
+
+        workspace.remove_window(20).unwrap();
+
+        assert_eq!(workspace.floating_windows().len(), 1);
+        let focused_idx = workspace.focused_floating_window_idx();
+        let len = workspace.floating_windows().len();
+        assert!(
+            focused_idx < len,
+            "floating focused idx {focused_idx} must remain within bounds (len {len})"
+        );
+        // Layer should remain Floating because another floating window is still present.
+        assert_eq!(workspace.layer, WorkspaceLayer::Floating);
+    }
+
+    #[test]
+    fn test_remove_non_focused_floating_window_keeps_layer() {
+        // Removing a non-focused floating window must not flip the layer or
+        // disturb the focused floating index when other floats remain.
+        let mut workspace = Workspace::default();
+
+        workspace.floating_windows_mut().push_back(Window::from(10));
+        workspace.floating_windows_mut().push_back(Window::from(20));
+        workspace.floating_windows.focus(1);
+        workspace.layer = WorkspaceLayer::Floating;
+
+        workspace.remove_window(10).unwrap();
+
+        assert_eq!(workspace.floating_windows().len(), 1);
+        assert_eq!(workspace.layer, WorkspaceLayer::Floating);
     }
 }
